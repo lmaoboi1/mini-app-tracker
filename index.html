@@ -558,7 +558,7 @@
             if (processedData.length > 0) {
                 processedData.forEach(row => {
                     const isChecked = state.adGroupStatuses[row._adGroupId] !== false;
-                    const rowClass = isChecked ? 'bg-green-50/20 dark:bg-green-900/10' : '';
+                    const rowClass = isChecked ? 'bg-green-100 dark:bg-green-800/40' : '';
                     
                     bodyHTML += `<tr class="hover:bg-gray-50 dark:hover:bg-gray-750/50 transition-colors ${rowClass}">`;
                     
