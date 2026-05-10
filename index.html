@@ -1,755 +1,708 @@
-import React, { useState, useMemo } from 'react';
-import { 
-  Upload, 
-  Calendar, 
-  Search, 
-  ArrowUpDown, 
-  Copy, 
-  CheckCircle2, 
-  FileSpreadsheet, 
-  MessageCircle, 
-  AlertCircle 
-} from 'lucide-react';
-
-// --- Utility Functions ---
-
-// Robust CSV Parser (Fallback for actual .csv files)
-const parseCSV = (str) => {
-  const rows = [];
-  let cur = '';
-  let inQuote = false;
-  let row = [];
-
-  for (let i = 0; i < str.length; i++) {
-    const char = str[i];
-    const nextChar = str[i + 1];
-
-    if (char === '"' && inQuote && nextChar === '"') {
-      cur += '"';
-      i++; // skip escaped quote
-    } else if (char === '"') {
-      inQuote = !inQuote;
-    } else if (char === ',' && !inQuote) {
-      row.push(cur.trim());
-      cur = '';
-    } else if ((char === '\n' || char === '\r') && !inQuote) {
-      if (char === '\r' && nextChar === '\n') i++; 
-      row.push(cur.trim());
-      if (row.join('') !== '') rows.push(row);
-      row = [];
-      cur = '';
-    } else {
-      cur += char;
-    }
-  }
-  if (cur !== '' || row.length > 0) {
-    row.push(cur.trim());
-    if (row.join('') !== '') rows.push(row);
-  }
-  return rows;
-};
-
-// Formats Telegram parsed UTC offset date to an LA-Timezone (YYYY-MM-DD)
-const getLADateString = (dateStr) => {
-  if (!dateStr) return null;
-  // Matches: 10.05.2026 19:34:30 UTC+02:00
-  const match = dateStr.match(/(\d{2})\.(\d{2})\.(\d{4})\s(\d{2}:\d{2}:\d{2})\sUTC([+-]\d{2}:\d{2})/);
-  
-  if (match) {
-    const [, day, month, year, time, offset] = match;
-    const isoString = `${year}-${month}-${day}T${time}${offset}`;
-    const dateObj = new Date(isoString);
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TikTok & Telegram Merger</title>
     
-    if (!isNaN(dateObj)) {
-      return new Intl.DateTimeFormat('en-CA', {
-        timeZone: 'America/Los_Angeles',
-        year: 'numeric',
-        month: '2-digit',
-        day: '2-digit'
-      }).format(dateObj); // Returns standard YYYY-MM-DD format
-    }
-  }
-  return null;
-};
-
-// Gets today's date in LA Timezone
-const getTodayLADate = () => {
-  return new Intl.DateTimeFormat('en-CA', {
-    timeZone: 'America/Los_Angeles',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit'
-  }).format(new Date());
-};
-
-export default function App() {
-  const [csvFile, setCsvFile] = useState(null);
-  const [htmlFile, setHtmlFile] = useState(null);
-  
-  const [isDraggingCsv, setIsDraggingCsv] = useState(false);
-  const [isDraggingHtml, setIsDraggingHtml] = useState(false);
-  
-  const [startDate, setStartDate] = useState(getTodayLADate());
-  const [endDate, setEndDate] = useState(getTodayLADate());
-  
-  const [data, setData] = useState([]);
-  const [headers, setHeaders] = useState([]);
-  
-  const [isProcessing, setIsProcessing] = useState(false);
-  const [error, setError] = useState('');
-  const [toastMessage, setToastMessage] = useState(null);
-
-  const [searchQuery, setSearchQuery] = useState('');
-  const [sortCol, setSortCol] = useState(null);
-  const [sortDesc, setSortDesc] = useState(false);
-
-  // Status mapping state (loaded from local memory)
-  const [adGroupStatuses, setAdGroupStatuses] = useState(() => {
-    try {
-      return JSON.parse(localStorage.getItem('tiktok_telegram_adgroup_statuses')) || {};
-    } catch (e) {
-      return {};
-    }
-  });
-
-  const toggleAdGroupStatus = (adGroupId) => {
-    if (!adGroupId) return;
-    setAdGroupStatuses(prev => {
-      // Default to true if undefined, so toggling means setting to false
-      const currentValue = prev[adGroupId] !== false;
-      const next = { ...prev, [adGroupId]: !currentValue };
-      try {
-        localStorage.setItem('tiktok_telegram_adgroup_statuses', JSON.stringify(next));
-      } catch (e) {
-        console.warn('Could not save to localStorage', e);
-      }
-      return next;
-    });
-  };
-
-  // --- Processing Logic ---
-  const handleProcessData = async () => {
-    if (!csvFile || !htmlFile) {
-      setError('Please upload both the TikTok Pivot (CSV/XLSX) and the Telegram HTML files.');
-      return;
-    }
-
-    setIsProcessing(true);
-    setError('');
-
-    try {
-      const htmlText = await htmlFile.text();
-
-      // 1. Process Telegram HTML
-      const parser = new DOMParser();
-      const doc = parser.parseFromString(htmlText, 'text/html');
-      const messages = doc.querySelectorAll('.message');
-      
-      const telegramConversions = {}; // AdGroupID -> Count mapping
-
-      messages.forEach(msg => {
-        const textEl = msg.querySelector('.text');
-        const dateEl = msg.querySelector('.date.details');
-
-        if (textEl && dateEl) {
-          // Convert internal <br> tags to newlines, then strip tags for robust matching
-          const innerHtml = textEl.innerHTML;
-          const plainText = innerHtml.replace(/<br\s*\/?>/gi, '\n').replace(/<[^>]+>/g, '');
-          
-          const isPurchase = plainText.includes('New Purchase event');
-          
-          if (isPurchase) {
-            const buyerMatch = plainText.match(/Buyer:\s*(.+)/);
-            const adGroupMatch = plainText.match(/Adgroup ID:\s*(\d+)/);
-
-            if (buyerMatch && adGroupMatch) {
-              const buyer = buyerMatch[1].trim();
-              const adGroupId = adGroupMatch[1].trim();
-
-              if (buyer === 'SLT') {
-                const dateTitle = dateEl.getAttribute('title');
-                const laDateStr = getLADateString(dateTitle);
-
-                // Date Filtering Check
-                let withinDateRange = true;
-                if (startDate && laDateStr && laDateStr < startDate) withinDateRange = false;
-                if (endDate && laDateStr && laDateStr > endDate) withinDateRange = false;
-
-                if (withinDateRange) {
-                  telegramConversions[adGroupId] = (telegramConversions[adGroupId] || 0) + 1;
-                }
-              }
-            }
-          }
-        }
-      });
-
-      // 2. Process TikTok CSV/XLSX
-      let parsedData = [];
-      const isXlsx = csvFile.name.toLowerCase().match(/\.xlsx?$/);
-
-      if (isXlsx) {
-        // Load XLSX Library dynamically and process file
-        parsedData = await new Promise((resolve, reject) => {
-          const processExcel = () => {
-            const reader = new FileReader();
-            reader.onload = (e) => {
-              try {
-                const buffer = new Uint8Array(e.target.result);
-                const workbook = window.XLSX.read(buffer, { type: 'array' });
-                const firstSheetName = workbook.SheetNames[0];
-                const worksheet = workbook.Sheets[firstSheetName];
-                const json = window.XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: '' });
-                // Filter out completely empty rows
-                const cleanRows = json.filter(row => row.length > 0 && row.some(cell => cell !== ''));
-                resolve(cleanRows);
-              } catch (err) {
-                reject(new Error('Could not parse the Excel file. Make sure it is a valid .xlsx file.'));
-              }
-            };
-            reader.readAsArrayBuffer(csvFile);
-          };
-
-          if (window.XLSX) {
-            processExcel();
-          } else {
-            const script = document.createElement('script');
-            script.src = 'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js';
-            script.onload = processExcel;
-            script.onerror = () => reject(new Error('Failed to load the Excel parser. Check your internet connection.'));
-            document.head.appendChild(script);
-          }
-        });
-      } else {
-        // Process as CSV
-        const csvText = await csvFile.text();
-        parsedData = parseCSV(csvText);
-      }
-
-      if (parsedData.length < 2) throw new Error('File appears to be empty or lacks data rows.');
-
-      // Remove the last row (Summary row)
-      parsedData.pop();
-
-      const originalHeaders = parsedData[0];
-      const dataRows = parsedData.slice(1);
-
-      // Locate column indices
-      const costPerConvIdx = originalHeaders.findIndex(h => h && h.toString().trim().toLowerCase() === 'cost per conversion');
-      const costIdx = originalHeaders.findIndex(h => h && h.toString().trim().toLowerCase() === 'cost');
-      const adGroupIdx = originalHeaders.findIndex(h => h && h.toString().trim().toLowerCase() === 'ad group id');
-
-      // Create new headers format
-      const finalHeaders = [...originalHeaders];
-      
-      const convIdx = finalHeaders.findIndex(h => h && h.toString().trim().toLowerCase() === 'conversions');
-      if (convIdx !== -1) {
-        finalHeaders.splice(convIdx + 1, 0, 'Conversion PP');
-      } else {
-        finalHeaders.push('Conversion PP');
-      }
-
-      const cpaHeaderIdx = finalHeaders.findIndex(h => h && h.toString().trim().toLowerCase() === 'cost per conversion');
-      if (cpaHeaderIdx !== -1) {
-        finalHeaders.splice(cpaHeaderIdx + 1, 0, 'CPA PP');
-      } else {
-        finalHeaders.push('CPA PP');
-      }
-
-      // Add Status as the very first column
-      finalHeaders.unshift('Status');
-
-      // Generate final JSON data array
-      const finalData = dataRows.map(row => {
-        const rowObj = {};
-        
-        // Map original data
-        originalHeaders.forEach((h, i) => {
-          rowObj[h] = row[i] || '';
-        });
-
-        const adGroupId = adGroupIdx !== -1 ? row[adGroupIdx]?.toString().trim() : '';
-        const conversionsPP = telegramConversions[adGroupId] || 0;
-        
-        const rawCost = costIdx !== -1 ? parseFloat(row[costIdx]) : 0;
-        const cost = isNaN(rawCost) ? 0 : rawCost;
-
-        rowObj['_adGroupId'] = adGroupId; // Internal reference for checkbox and matching
-        rowObj['Conversion PP'] = conversionsPP;
-        rowObj['CPA PP'] = conversionsPP > 0 ? (cost / conversionsPP).toFixed(2) : "0.00";
-
-        return rowObj;
-      });
-
-      setHeaders(finalHeaders);
-      setData(finalData);
-      
-    } catch (err) {
-      setError(`Failed to process files: ${err.message}`);
-    } finally {
-      setIsProcessing(false);
-    }
-  };
-
-  // --- Interaction Logic ---
-  const handleCopy = (text) => {
-    if (!text) return;
-    const el = document.createElement('textarea');
-    el.value = text;
-    document.body.appendChild(el);
-    el.select();
-    document.execCommand('copy');
-    document.body.removeChild(el);
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
     
-    setToastMessage(`Copied: ${text}`);
-    setTimeout(() => setToastMessage(null), 3000);
-  };
+    <!-- Lucide Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+    
+    <!-- XLSX library (pre-loaded for Excel support) -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 
-  const handleSort = (col) => {
-    if (sortCol === col) {
-      setSortDesc(!sortDesc);
-    } else {
-      setSortCol(col);
-      setSortDesc(false);
-    }
-  };
-
-  // Filter & Sort Data
-  const processedData = useMemo(() => {
-    let result = [...data];
-
-    // Search filter
-    if (searchQuery) {
-      const terms = searchQuery.trim().split(/\s+/);
-
-      result = result.filter(row => {
-        return terms.every(term => {
-          // Parse formulas like spend>50 or conversions<=10
-          const formulaMatch = term.match(/^(.+?)(>=|<=|>|<|=)(.+)$/);
-
-          if (formulaMatch) {
-            const fieldRaw = formulaMatch[1].toLowerCase();
-            const op = formulaMatch[2];
-            const val = parseFloat(formulaMatch[3]);
-
-            if (!isNaN(val)) {
-              const field = fieldRaw.replace(/_/g, '');
-              
-              const targetHeader = headers.find(h => {
-                const lowerH = h.toLowerCase().trim();
-                const noSpaceH = lowerH.replace(/\s+/g, '');
-                if (field === 'spend' && lowerH === 'cost') return true;
-                if (field === 'cpa' && lowerH === 'cost per conversion') return true;
-                if (noSpaceH === field) return true;
-                return false;
-              }) || headers.find(h => {
-                const noSpaceH = h.toLowerCase().replace(/\s+/g, '');
-                return noSpaceH.includes(field);
-              });
-
-              if (targetHeader) {
-                const rowValStr = row[targetHeader] ? row[targetHeader].toString() : '';
-                const rowVal = parseFloat(rowValStr);
-                
-                if (!isNaN(rowVal)) {
-                  if (op === '>') return rowVal > val;
-                  if (op === '<') return rowVal < val;
-                  if (op === '>=') return rowVal >= val;
-                  if (op === '<=') return rowVal <= val;
-                  if (op === '=') return rowVal === val || rowValStr.trim() === formulaMatch[3];
-                }
-              }
-            }
-          }
-
-          // Fallback text match
-          const lowerTerm = term.toLowerCase();
-          return Object.values(row).some(v => 
-            v && v.toString().toLowerCase().includes(lowerTerm)
-          );
-        });
-      });
-    }
-
-    // Sorting
-    if (sortCol) {
-      result.sort((a, b) => {
-        if (sortCol === 'Status') {
-          // Default to 1 (true) if undefined
-          const statusA = adGroupStatuses[a._adGroupId] !== false ? 1 : 0;
-          const statusB = adGroupStatuses[b._adGroupId] !== false ? 1 : 0;
-          return sortDesc ? statusB - statusA : statusA - statusB;
+    <style>
+        @keyframes bounce-short {
+            0%, 100% { transform: translateY(0); }
+            50% { transform: translateY(-10%); }
         }
-
-        let valA = a[sortCol];
-        let valB = b[sortCol];
-
-        const numA = parseFloat(valA);
-        const numB = parseFloat(valB);
-
-        if (!isNaN(numA) && !isNaN(numB)) {
-          return sortDesc ? numB - numA : numA - numB;
+        .animate-bounce-short {
+            animation: bounce-short 0.5s ease-in-out;
         }
-
-        valA = valA ? valA.toString() : '';
-        valB = valB ? valB.toString() : '';
-        return sortDesc ? valB.localeCompare(valA) : valA.localeCompare(valB);
-      });
-    }
-
-    return result;
-  }, [data, searchQuery, sortCol, sortDesc, headers, adGroupStatuses]);
-
-  // Calculate Summary Row dynamically based on processed (filtered/sorted) data
-  const summaryRow = useMemo(() => {
-    if (!processedData || processedData.length === 0) return null;
-
-    const getHeaderKey = (targetLower) => headers.find(h => h.toLowerCase().trim() === targetLower);
-    const keyCost = getHeaderKey('cost');
-    const keyConversions = getHeaderKey('conversions');
-    const keyClicks = getHeaderKey('clicks (destination)');
-    const keyRegs = getHeaderKey('registrations (website)');
-    const keyConvPP = getHeaderKey('conversion pp');
-
-    let totalCost = 0;
-    let totalConversions = 0;
-    let totalClicks = 0;
-    let totalRegs = 0;
-    let totalConvPP = 0;
-
-    // First accumulate raw sums
-    processedData.forEach(row => {
-      if (keyCost) totalCost += parseFloat(row[keyCost]) || 0;
-      if (keyConversions) totalConversions += parseFloat(row[keyConversions]) || 0;
-      if (keyClicks) totalClicks += parseFloat(row[keyClicks]) || 0;
-      if (keyRegs) totalRegs += parseFloat(row[keyRegs]) || 0;
-      if (keyConvPP) totalConvPP += parseFloat(row[keyConvPP]) || 0;
-    });
-
-    const summary = {};
-    let hasPlacedSummaryText = false;
-
-    headers.forEach((h, index) => {
-      const lowerH = h.toLowerCase().trim();
-      
-      // Skip status for calculation and summary text placement
-      if (lowerH === 'status') {
-        summary[h] = '';
-        return;
-      }
-
-      // Place title in the first available text column
-      if (!hasPlacedSummaryText) {
-        summary[h] = 'Summary';
-        hasPlacedSummaryText = true;
-        return;
-      }
-
-      // Format formula-based columns and skip explicitly ignored ones
-      if (lowerH === 'ctr (destination)') {
-        summary[h] = '-';
-      } else if (lowerH === 'cost per conversion') {
-        summary[h] = totalConversions > 0 ? (totalCost / totalConversions).toFixed(2) : '0.00';
-      } else if (lowerH === 'cpc (destination)') {
-        summary[h] = totalClicks > 0 ? (totalCost / totalClicks).toFixed(2) : '0.00';
-      } else if (lowerH === 'cost per registration (website)') {
-        summary[h] = totalRegs > 0 ? (totalCost / totalRegs).toFixed(2) : '0.00';
-      } else if (lowerH === 'cpa pp') {
-        summary[h] = totalConvPP > 0 ? (totalCost / totalConvPP).toFixed(2) : '0.00';
-      } else if (lowerH === 'cost') {
-        summary[h] = totalCost.toFixed(2);
-      } else if (lowerH === 'conversions') {
-        summary[h] = totalConversions;
-      } else if (lowerH === 'clicks (destination)') {
-        summary[h] = totalClicks;
-      } else if (lowerH === 'registrations (website)') {
-        summary[h] = totalRegs;
-      } else if (lowerH === 'conversion pp') {
-        summary[h] = totalConvPP;
-      } else {
-        summary[h] = ''; // Blank for text/ID columns
-      }
-    });
-
-    return summary;
-  }, [processedData, headers]);
-
-  // --- Drag and Drop Handlers ---
-  const onDragOverCsv = (e) => {
-    e.preventDefault();
-    setIsDraggingCsv(true);
-  };
-  const onDragLeaveCsv = (e) => {
-    e.preventDefault();
-    setIsDraggingCsv(false);
-  };
-  const onDropCsv = (e) => {
-    e.preventDefault();
-    setIsDraggingCsv(false);
-    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
-      setCsvFile(e.dataTransfer.files[0]);
-    }
-  };
-
-  const onDragOverHtml = (e) => {
-    e.preventDefault();
-    setIsDraggingHtml(true);
-  };
-  const onDragLeaveHtml = (e) => {
-    e.preventDefault();
-    setIsDraggingHtml(false);
-  };
-  const onDropHtml = (e) => {
-    e.preventDefault();
-    setIsDraggingHtml(false);
-    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
-      setHtmlFile(e.dataTransfer.files[0]);
-    }
-  };
-
-  return (
-    <div className="min-h-screen bg-gray-50 dark:bg-gray-900 text-gray-900 dark:text-gray-100 p-4 md:p-8 font-sans">
-      <div className="max-w-7xl mx-auto space-y-6">
         
-        {/* Header */}
-        <header className="mb-8">
-          <h1 className="text-3xl font-bold tracking-tight text-gray-900 dark:text-white">
-            TikTok & Telegram Merger
-          </h1>
-          <p className="text-gray-500 dark:text-gray-400 mt-2">
-            Merge TikTok pivot tables with Telegram bot event history for customized CPA metrics.
-          </p>
+        /* Highlight specific formula columns */
+        .col-special { background-color: rgba(239, 246, 255, 0.5); }
+        .dark .col-special { background-color: rgba(30, 58, 138, 0.2); }
+    </style>
+</head>
+<body class="min-h-screen bg-gray-50 dark:bg-gray-900 text-gray-900 dark:text-gray-100 p-4 md:p-8 font-sans transition-colors duration-200">
+    <div class="max-w-7xl mx-auto space-y-6">
+        
+        <!-- Header -->
+        <header class="mb-8">
+            <h1 class="text-3xl font-bold tracking-tight text-gray-900 dark:text-white">
+                TikTok & Telegram Merger
+            </h1>
+            <p class="text-gray-500 dark:text-gray-400 mt-2">
+                Merge TikTok pivot tables with Telegram bot event history for customized CPA metrics.
+            </p>
         </header>
 
-        {/* Controls Card */}
-        <div className="bg-white dark:bg-gray-800 p-6 rounded-xl shadow-sm border border-gray-200 dark:border-gray-700">
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-            
-            {/* File Uploads */}
-            <div className="space-y-4">
-              <h3 className="text-sm font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">Data Sources</h3>
-              
-              <div className="flex flex-col gap-3">
-                <label 
-                  onDragOver={onDragOverCsv}
-                  onDragLeave={onDragLeaveCsv}
-                  onDrop={onDropCsv}
-                  className={`flex items-center p-4 border-2 border-dashed rounded-lg cursor-pointer transition-colors ${
-                    isDraggingCsv 
-                      ? 'border-blue-500 bg-blue-50 dark:bg-blue-900/20' 
-                      : 'border-gray-300 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-750'
-                  }`}
-                >
-                  <FileSpreadsheet className={`w-6 h-6 mr-3 ${isDraggingCsv ? 'text-blue-500' : 'text-green-600 dark:text-green-400'}`} />
-                  <div className="flex-1 overflow-hidden">
-                    <span className="block text-sm font-medium truncate">
-                      {csvFile ? csvFile.name : 'Upload TikTok Pivot (XLSX / CSV)'}
-                    </span>
-                    <span className="block text-xs text-gray-500 dark:text-gray-400 mt-0.5">
-                      Drag & drop or click to browse
-                    </span>
-                  </div>
-                  <input type="file" accept=".csv,.xlsx,.xls" className="hidden" onChange={(e) => setCsvFile(e.target.files[0])} />
-                  <Upload className={`w-5 h-5 ${isDraggingCsv ? 'text-blue-500' : 'text-gray-400'}`} />
-                </label>
+        <!-- Controls Card -->
+        <div class="bg-white dark:bg-gray-800 p-6 rounded-xl shadow-sm border border-gray-200 dark:border-gray-700">
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                
+                <!-- File Uploads -->
+                <div class="space-y-4">
+                    <h3 class="text-sm font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">Data Sources</h3>
+                    
+                    <div class="flex flex-col gap-3">
+                        <label id="csvDropZone" class="flex items-center p-4 border-2 border-dashed border-gray-300 dark:border-gray-600 rounded-lg cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-750 transition-colors">
+                            <i data-lucide="file-spreadsheet" class="w-6 h-6 mr-3 text-green-600 dark:text-green-400" id="csvIcon"></i>
+                            <div class="flex-1 overflow-hidden">
+                                <span id="csvFileName" class="block text-sm font-medium truncate">Upload TikTok Pivot (XLSX / CSV)</span>
+                                <span class="block text-xs text-gray-500 dark:text-gray-400 mt-0.5">Drag & drop or click to browse</span>
+                            </div>
+                            <input type="file" id="csvInput" accept=".csv,.xlsx,.xls" class="hidden" />
+                            <i data-lucide="upload" class="w-5 h-5 text-gray-400" id="csvUploadIcon"></i>
+                        </label>
 
-                <label 
-                  onDragOver={onDragOverHtml}
-                  onDragLeave={onDragLeaveHtml}
-                  onDrop={onDropHtml}
-                  className={`flex items-center p-4 border-2 border-dashed rounded-lg cursor-pointer transition-colors ${
-                    isDraggingHtml 
-                      ? 'border-blue-500 bg-blue-50 dark:bg-blue-900/20' 
-                      : 'border-gray-300 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-750'
-                  }`}
-                >
-                  <MessageCircle className={`w-6 h-6 mr-3 ${isDraggingHtml ? 'text-blue-500' : 'text-blue-500 dark:text-blue-400'}`} />
-                  <div className="flex-1 overflow-hidden">
-                    <span className="block text-sm font-medium truncate">
-                      {htmlFile ? htmlFile.name : 'Upload Telegram Messages (HTML)'}
-                    </span>
-                    <span className="block text-xs text-gray-500 dark:text-gray-400 mt-0.5">
-                      Drag & drop or click to browse
-                    </span>
-                  </div>
-                  <input type="file" accept=".html" className="hidden" onChange={(e) => setHtmlFile(e.target.files[0])} />
-                  <Upload className={`w-5 h-5 ${isDraggingHtml ? 'text-blue-500' : 'text-gray-400'}`} />
-                </label>
-              </div>
-            </div>
-
-            {/* Date Filtering */}
-            <div className="space-y-4">
-              <h3 className="text-sm font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">
-                Telegram Date Filter (LA Timezone)
-              </h3>
-              
-              <div className="flex gap-4">
-                <div className="flex-1 space-y-1">
-                  <label className="text-xs text-gray-500 dark:text-gray-400 block">Start Date</label>
-                  <div className="relative">
-                    <Calendar className="absolute left-3 top-2.5 w-4 h-4 text-gray-400" />
-                    <input 
-                      type="date" 
-                      value={startDate}
-                      onChange={(e) => setStartDate(e.target.value)}
-                      className="w-full pl-9 pr-3 py-2 bg-transparent border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none"
-                    />
-                  </div>
+                        <label id="htmlDropZone" class="flex items-center p-4 border-2 border-dashed border-gray-300 dark:border-gray-600 rounded-lg cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-750 transition-colors">
+                            <i data-lucide="message-circle" class="w-6 h-6 mr-3 text-blue-500 dark:text-blue-400" id="htmlIcon"></i>
+                            <div class="flex-1 overflow-hidden">
+                                <span id="htmlFileName" class="block text-sm font-medium truncate">Upload Telegram Messages (HTML)</span>
+                                <span class="block text-xs text-gray-500 dark:text-gray-400 mt-0.5">Drag & drop or click to browse</span>
+                            </div>
+                            <input type="file" id="htmlInput" accept=".html" class="hidden" />
+                            <i data-lucide="upload" class="w-5 h-5 text-gray-400" id="htmlUploadIcon"></i>
+                        </label>
+                    </div>
                 </div>
-                <div className="flex-1 space-y-1">
-                  <label className="text-xs text-gray-500 dark:text-gray-400 block">End Date</label>
-                  <div className="relative">
-                    <Calendar className="absolute left-3 top-2.5 w-4 h-4 text-gray-400" />
-                    <input 
-                      type="date" 
-                      value={endDate}
-                      onChange={(e) => setEndDate(e.target.value)}
-                      className="w-full pl-9 pr-3 py-2 bg-transparent border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none"
-                    />
-                  </div>
-                </div>
-              </div>
 
-              <div className="pt-2">
-                <button
-                  onClick={handleProcessData}
-                  disabled={isProcessing}
-                  className="w-full bg-blue-600 hover:bg-blue-700 disabled:bg-blue-400 text-white font-medium py-2.5 px-4 rounded-lg transition-colors flex justify-center items-center"
-                >
-                  {isProcessing ? 'Processing...' : 'Merge & Process Data'}
-                </button>
-              </div>
+                <!-- Date Filtering -->
+                <div class="space-y-4">
+                    <h3 class="text-sm font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">
+                        Telegram Date Filter (LA Timezone)
+                    </h3>
+                    
+                    <div class="flex gap-4">
+                        <div class="flex-1 space-y-1">
+                            <label class="text-xs text-gray-500 dark:text-gray-400 block">Start Date</label>
+                            <div class="relative">
+                                <i data-lucide="calendar" class="absolute left-3 top-2.5 w-4 h-4 text-gray-400"></i>
+                                <input type="date" id="startDate" class="w-full pl-9 pr-3 py-2 bg-transparent border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none dark:text-white" />
+                            </div>
+                        </div>
+                        <div class="flex-1 space-y-1">
+                            <label class="text-xs text-gray-500 dark:text-gray-400 block">End Date</label>
+                            <div class="relative">
+                                <i data-lucide="calendar" class="absolute left-3 top-2.5 w-4 h-4 text-gray-400"></i>
+                                <input type="date" id="endDate" class="w-full pl-9 pr-3 py-2 bg-transparent border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none dark:text-white" />
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="pt-2">
+                        <button id="processBtn" class="w-full bg-blue-600 hover:bg-blue-700 disabled:bg-blue-400 text-white font-medium py-2.5 px-4 rounded-lg transition-colors flex justify-center items-center">
+                            Merge & Process Data
+                        </button>
+                    </div>
+                </div>
             </div>
             
-          </div>
-          
-          {error && (
-            <div className="mt-4 p-3 bg-red-50 dark:bg-red-900/30 text-red-700 dark:text-red-400 rounded-lg flex items-center border border-red-200 dark:border-red-800">
-              <AlertCircle className="w-5 h-5 mr-2 flex-shrink-0" />
-              <p className="text-sm">{error}</p>
+            <div id="errorContainer" class="hidden mt-4 p-3 bg-red-50 dark:bg-red-900/30 text-red-700 dark:text-red-400 rounded-lg flex items-center border border-red-200 dark:border-red-800">
+                <i data-lucide="alert-circle" class="w-5 h-5 mr-2 flex-shrink-0"></i>
+                <p id="errorMessage" class="text-sm"></p>
             </div>
-          )}
         </div>
 
-        {/* Data Table Section */}
-        {data.length > 0 && (
-          <div className="bg-white dark:bg-gray-800 rounded-xl shadow-sm border border-gray-200 dark:border-gray-700 overflow-hidden flex flex-col">
+        <!-- Data Table Section -->
+        <div id="tableSection" class="hidden bg-white dark:bg-gray-800 rounded-xl shadow-sm border border-gray-200 dark:border-gray-700 overflow-hidden flex flex-col">
             
-            {/* Table Toolbar */}
-            <div className="p-4 border-b border-gray-200 dark:border-gray-700 flex flex-col sm:flex-row justify-between items-center gap-4 bg-gray-50/50 dark:bg-gray-800/50">
-              <div className="relative w-full sm:w-96">
-                <Search className="absolute left-3 top-2.5 w-4 h-4 text-gray-400" />
-                <input
-                  type="text"
-                  placeholder="Search text or formulas (e.g. spend>50 cpapp<10)..."
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                  className="w-full pl-9 pr-3 py-2 bg-white dark:bg-gray-900 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none text-sm"
-                />
-              </div>
-              <div className="text-sm text-gray-500 dark:text-gray-400 font-medium">
-                Showing {processedData.length} records
-              </div>
+            <!-- Table Toolbar -->
+            <div class="p-4 border-b border-gray-200 dark:border-gray-700 flex flex-col sm:flex-row justify-between items-center gap-4 bg-gray-50/50 dark:bg-gray-800/50">
+                <div class="relative w-full sm:w-96">
+                    <i data-lucide="search" class="absolute left-3 top-2.5 w-4 h-4 text-gray-400"></i>
+                    <input type="text" id="searchInput" placeholder="Search text or formulas (e.g. spend>50 cpapp<10)..." class="w-full pl-9 pr-3 py-2 bg-white dark:bg-gray-900 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none text-sm dark:text-white" />
+                </div>
+                <div id="recordCount" class="text-sm text-gray-500 dark:text-gray-400 font-medium">
+                    Showing 0 records
+                </div>
             </div>
 
-            {/* Responsive Table Wrapper */}
-            <div className="overflow-auto max-h-[65vh] relative">
-              <table className="w-full text-left text-sm whitespace-nowrap">
-                <thead className="sticky top-0 z-20 shadow-sm">
-                  <tr>
-                    {headers.map((h, i) => (
-                      <th 
-                        key={i} 
-                        className={`px-4 py-3 bg-gray-100 dark:bg-gray-900 font-semibold cursor-pointer hover:bg-gray-200 dark:hover:bg-gray-800 transition-colors border-b border-gray-200 dark:border-gray-700 group select-none ${h === 'Status' ? 'text-center w-16' : ''}`}
-                        onClick={() => handleSort(h)}
-                      >
-                        <div className={`flex items-center gap-1 ${h === 'Status' ? 'justify-center' : ''}`}>
-                          {h}
-                          <ArrowUpDown className={`w-3 h-3 transition-opacity ${sortCol === h ? 'opacity-100 text-blue-500' : 'opacity-0 group-hover:opacity-50'}`} />
+            <!-- Responsive Table Wrapper -->
+            <div class="overflow-auto max-h-[65vh] relative" id="tableWrapper">
+                <table class="w-full text-left text-sm whitespace-nowrap">
+                    <thead id="tableHead" class="sticky top-0 z-20 shadow-sm bg-gray-100 dark:bg-gray-900 text-gray-600 dark:text-gray-300">
+                        <!-- Head rendered dynamically -->
+                    </thead>
+                    <tbody id="tableBody" class="divide-y divide-gray-200 dark:divide-gray-700">
+                        <!-- Body rendered dynamically -->
+                    </tbody>
+                    <tfoot id="tableFoot" class="sticky bottom-0 z-20 shadow-[0_-1px_3px_rgba(0,0,0,0.1)] dark:shadow-[0_-1px_3px_rgba(0,0,0,0.3)] bg-gray-200 dark:bg-gray-700">
+                        <!-- Footer rendered dynamically -->
+                    </tfoot>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- Floating Toast Notification -->
+    <div id="toast" class="fixed bottom-6 right-6 bg-gray-900 dark:bg-white text-white dark:text-gray-900 px-4 py-3 rounded-lg shadow-lg flex items-center gap-2 z-50 transform translate-y-20 opacity-0 transition-all duration-300 pointer-events-none">
+        <i data-lucide="check-circle-2" class="w-5 h-5 text-green-400 dark:text-green-600"></i>
+        <span id="toastMessage" class="text-sm font-medium"></span>
+    </div>
+
+    <script>
+        // --- State Management ---
+        const state = {
+            csvFile: null,
+            htmlFile: null,
+            data: [],
+            headers: [],
+            searchQuery: '',
+            sortCol: null,
+            sortDesc: false,
+            adGroupStatuses: JSON.parse(localStorage.getItem('tiktok_telegram_adgroup_statuses')) || {}
+        };
+
+        // --- Utility Functions ---
+        const getTodayLADate = () => {
+            return new Intl.DateTimeFormat('en-CA', {
+                timeZone: 'America/Los_Angeles',
+                year: 'numeric',
+                month: '2-digit',
+                day: '2-digit'
+            }).format(new Date());
+        };
+
+        const getLADateString = (dateStr) => {
+            if (!dateStr) return null;
+            const match = dateStr.match(/(\d{2})\.(\d{2})\.(\d{4})\s(\d{2}:\d{2}:\d{2})\sUTC([+-]\d{2}:\d{2})/);
+            if (match) {
+                const [, day, month, year, time, offset] = match;
+                const isoString = `${year}-${month}-${day}T${time}${offset}`;
+                const dateObj = new Date(isoString);
+                if (!isNaN(dateObj)) {
+                    return new Intl.DateTimeFormat('en-CA', {
+                        timeZone: 'America/Los_Angeles',
+                        year: 'numeric',
+                        month: '2-digit',
+                        day: '2-digit'
+                    }).format(dateObj);
+                }
+            }
+            return null;
+        };
+
+        const parseCSV = (str) => {
+            const rows = [];
+            let cur = '';
+            let inQuote = false;
+            let row = [];
+
+            for (let i = 0; i < str.length; i++) {
+                const char = str[i];
+                const nextChar = str[i + 1];
+
+                if (char === '"' && inQuote && nextChar === '"') {
+                    cur += '"';
+                    i++; 
+                } else if (char === '"') {
+                    inQuote = !inQuote;
+                } else if (char === ',' && !inQuote) {
+                    row.push(cur.trim());
+                    cur = '';
+                } else if ((char === '\n' || char === '\r') && !inQuote) {
+                    if (char === '\r' && nextChar === '\n') i++; 
+                    row.push(cur.trim());
+                    if (row.join('') !== '') rows.push(row);
+                    row = [];
+                    cur = '';
+                } else {
+                    cur += char;
+                }
+            }
+            if (cur !== '' || row.length > 0) {
+                row.push(cur.trim());
+                if (row.join('') !== '') rows.push(row);
+            }
+            return rows;
+        };
+
+        const toggleAdGroupStatus = (adGroupId) => {
+            if (!adGroupId) return;
+            const currentValue = state.adGroupStatuses[adGroupId] !== false;
+            state.adGroupStatuses[adGroupId] = !currentValue;
+            try {
+                localStorage.setItem('tiktok_telegram_adgroup_statuses', JSON.stringify(state.adGroupStatuses));
+            } catch (e) {
+                console.warn('Could not save to localStorage', e);
+            }
+            renderTable();
+        };
+
+        const showToast = (message) => {
+            const toast = document.getElementById('toast');
+            document.getElementById('toastMessage').textContent = message;
+            toast.classList.remove('translate-y-20', 'opacity-0');
+            toast.classList.add('animate-bounce-short');
+            
+            setTimeout(() => {
+                toast.classList.add('translate-y-20', 'opacity-0');
+                toast.classList.remove('animate-bounce-short');
+            }, 3000);
+        };
+
+        const showError = (message) => {
+            const container = document.getElementById('errorContainer');
+            if (message) {
+                document.getElementById('errorMessage').textContent = message;
+                container.classList.remove('hidden');
+            } else {
+                container.classList.add('hidden');
+            }
+        };
+
+        // --- Core Processing Logic ---
+        const handleProcessData = async () => {
+            const startDate = document.getElementById('startDate').value;
+            const endDate = document.getElementById('endDate').value;
+
+            if (!state.csvFile || !state.htmlFile) {
+                showError('Please upload both the TikTok Pivot (CSV/XLSX) and the Telegram HTML files.');
+                return;
+            }
+
+            const btn = document.getElementById('processBtn');
+            btn.disabled = true;
+            btn.textContent = 'Processing...';
+            showError('');
+
+            try {
+                const htmlText = await state.htmlFile.text();
+
+                // 1. Process Telegram HTML
+                const parser = new DOMParser();
+                const doc = parser.parseFromString(htmlText, 'text/html');
+                const messages = doc.querySelectorAll('.message');
+                const telegramConversions = {}; 
+
+                messages.forEach(msg => {
+                    const textEl = msg.querySelector('.text');
+                    const dateEl = msg.querySelector('.date.details');
+
+                    if (textEl && dateEl) {
+                        const plainText = textEl.innerHTML.replace(/<br\s*\/?>/gi, '\n').replace(/<[^>]+>/g, '');
+                        const isPurchase = plainText.includes('New Purchase event');
+                        
+                        if (isPurchase) {
+                            const buyerMatch = plainText.match(/Buyer:\s*(.+)/);
+                            const adGroupMatch = plainText.match(/Adgroup ID:\s*(\d+)/);
+
+                            if (buyerMatch && adGroupMatch) {
+                                const buyer = buyerMatch[1].trim();
+                                const adGroupId = adGroupMatch[1].trim();
+
+                                if (buyer === 'SLT') {
+                                    const dateTitle = dateEl.getAttribute('title');
+                                    const laDateStr = getLADateString(dateTitle);
+
+                                    let withinDateRange = true;
+                                    if (startDate && laDateStr && laDateStr < startDate) withinDateRange = false;
+                                    if (endDate && laDateStr && laDateStr > endDate) withinDateRange = false;
+
+                                    if (withinDateRange) {
+                                        telegramConversions[adGroupId] = (telegramConversions[adGroupId] || 0) + 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+
+                // 2. Process TikTok CSV/XLSX
+                let parsedData = [];
+                const isXlsx = state.csvFile.name.toLowerCase().match(/\.xlsx?$/);
+
+                if (isXlsx) {
+                    parsedData = await new Promise((resolve, reject) => {
+                        const reader = new FileReader();
+                        reader.onload = (e) => {
+                            try {
+                                const buffer = new Uint8Array(e.target.result);
+                                const workbook = window.XLSX.read(buffer, { type: 'array' });
+                                const worksheet = workbook.Sheets[workbook.SheetNames[0]];
+                                const json = window.XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: '' });
+                                const cleanRows = json.filter(row => row.length > 0 && row.some(cell => cell !== ''));
+                                resolve(cleanRows);
+                            } catch (err) {
+                                reject(new Error('Could not parse the Excel file. Make sure it is a valid .xlsx file.'));
+                            }
+                        };
+                        reader.onerror = () => reject(new Error('Failed to read file'));
+                        reader.readAsArrayBuffer(state.csvFile);
+                    });
+                } else {
+                    const csvText = await state.csvFile.text();
+                    parsedData = parseCSV(csvText);
+                }
+
+                if (parsedData.length < 2) throw new Error('File appears to be empty or lacks data rows.');
+                parsedData.pop(); // Remove summary row
+
+                const originalHeaders = parsedData[0];
+                const dataRows = parsedData.slice(1);
+
+                const getColIdx = (name) => originalHeaders.findIndex(h => h && h.toString().trim().toLowerCase() === name.toLowerCase());
+                const costPerConvIdx = getColIdx('cost per conversion');
+                const costIdx = getColIdx('cost');
+                const adGroupIdx = getColIdx('ad group id');
+
+                const finalHeaders = [...originalHeaders];
+                
+                const convIdx = getColIdx('conversions');
+                if (convIdx !== -1) finalHeaders.splice(convIdx + 1, 0, 'Conversion PP');
+                else finalHeaders.push('Conversion PP');
+
+                const cpaHeaderIdx = finalHeaders.findIndex(h => h && h.toString().trim().toLowerCase() === 'cost per conversion');
+                if (cpaHeaderIdx !== -1) finalHeaders.splice(cpaHeaderIdx + 1, 0, 'CPA PP');
+                else finalHeaders.push('CPA PP');
+
+                finalHeaders.unshift('Status');
+
+                const finalData = dataRows.map(row => {
+                    const rowObj = {};
+                    originalHeaders.forEach((h, i) => rowObj[h] = row[i] || '');
+
+                    const adGroupId = adGroupIdx !== -1 ? row[adGroupIdx]?.toString().trim() : '';
+                    const conversionsPP = telegramConversions[adGroupId] || 0;
+                    const rawCost = costIdx !== -1 ? parseFloat(row[costIdx]) : 0;
+                    const cost = isNaN(rawCost) ? 0 : rawCost;
+
+                    rowObj['_adGroupId'] = adGroupId;
+                    rowObj['Conversion PP'] = conversionsPP;
+                    rowObj['CPA PP'] = conversionsPP > 0 ? (cost / conversionsPP).toFixed(2) : "0.00";
+
+                    return rowObj;
+                });
+
+                state.headers = finalHeaders;
+                state.data = finalData;
+                
+                document.getElementById('tableSection').classList.remove('hidden');
+                renderTable();
+
+            } catch (err) {
+                showError(`Failed to process files: ${err.message}`);
+            } finally {
+                btn.disabled = false;
+                btn.textContent = 'Merge & Process Data';
+            }
+        };
+
+        // --- Data Filtering and Sorting ---
+        const getProcessedData = () => {
+            let result = [...state.data];
+
+            if (state.searchQuery) {
+                const terms = state.searchQuery.trim().split(/\s+/);
+                result = result.filter(row => {
+                    return terms.every(term => {
+                        const formulaMatch = term.match(/^(.+?)(>=|<=|>|<|=)(.+)$/);
+                        if (formulaMatch) {
+                            const fieldRaw = formulaMatch[1].toLowerCase();
+                            const op = formulaMatch[2];
+                            const val = parseFloat(formulaMatch[3]);
+
+                            if (!isNaN(val)) {
+                                const field = fieldRaw.replace(/_/g, '');
+                                const targetHeader = state.headers.find(h => {
+                                    const lowerH = h.toLowerCase().trim();
+                                    const noSpaceH = lowerH.replace(/\s+/g, '');
+                                    if (field === 'spend' && lowerH === 'cost') return true;
+                                    if (field === 'cpa' && lowerH === 'cost per conversion') return true;
+                                    if (noSpaceH === field) return true;
+                                    return false;
+                                }) || state.headers.find(h => h.toLowerCase().replace(/\s+/g, '').includes(field));
+
+                                if (targetHeader) {
+                                    const rowValStr = row[targetHeader] ? row[targetHeader].toString() : '';
+                                    const rowVal = parseFloat(rowValStr);
+                                    if (!isNaN(rowVal)) {
+                                        if (op === '>') return rowVal > val;
+                                        if (op === '<') return rowVal < val;
+                                        if (op === '>=') return rowVal >= val;
+                                        if (op === '<=') return rowVal <= val;
+                                        if (op === '=') return rowVal === val || rowValStr.trim() === formulaMatch[3];
+                                    }
+                                }
+                            }
+                        }
+
+                        const lowerTerm = term.toLowerCase();
+                        return Object.values(row).some(v => v && v.toString().toLowerCase().includes(lowerTerm));
+                    });
+                });
+            }
+
+            if (state.sortCol) {
+                result.sort((a, b) => {
+                    if (state.sortCol === 'Status') {
+                        const statusA = state.adGroupStatuses[a._adGroupId] !== false ? 1 : 0;
+                        const statusB = state.adGroupStatuses[b._adGroupId] !== false ? 1 : 0;
+                        return state.sortDesc ? statusB - statusA : statusA - statusB;
+                    }
+
+                    let valA = a[state.sortCol];
+                    let valB = b[state.sortCol];
+                    const numA = parseFloat(valA);
+                    const numB = parseFloat(valB);
+
+                    if (!isNaN(numA) && !isNaN(numB)) {
+                        return state.sortDesc ? numB - numA : numA - numB;
+                    }
+
+                    valA = valA ? valA.toString() : '';
+                    valB = valB ? valB.toString() : '';
+                    return state.sortDesc ? valB.localeCompare(valA) : valA.localeCompare(valB);
+                });
+            }
+
+            return result;
+        };
+
+        const getSummaryRow = (processedData) => {
+            if (!processedData || processedData.length === 0) return null;
+
+            const getHeaderKey = (target) => state.headers.find(h => h.toLowerCase().trim() === target);
+            const keyCost = getHeaderKey('cost');
+            const keyConversions = getHeaderKey('conversions');
+            const keyClicks = getHeaderKey('clicks (destination)');
+            const keyRegs = getHeaderKey('registrations (website)');
+            const keyConvPP = getHeaderKey('conversion pp');
+
+            let totals = { cost: 0, conv: 0, clicks: 0, regs: 0, convPP: 0 };
+
+            processedData.forEach(row => {
+                if (keyCost) totals.cost += parseFloat(row[keyCost]) || 0;
+                if (keyConversions) totals.conv += parseFloat(row[keyConversions]) || 0;
+                if (keyClicks) totals.clicks += parseFloat(row[keyClicks]) || 0;
+                if (keyRegs) totals.regs += parseFloat(row[keyRegs]) || 0;
+                if (keyConvPP) totals.convPP += parseFloat(row[keyConvPP]) || 0;
+            });
+
+            const summary = {};
+            let hasPlacedSummaryText = false;
+
+            state.headers.forEach((h) => {
+                const lowerH = h.toLowerCase().trim();
+                
+                if (lowerH === 'status') {
+                    summary[h] = '';
+                    return;
+                }
+
+                if (!hasPlacedSummaryText) {
+                    summary[h] = 'Summary';
+                    hasPlacedSummaryText = true;
+                    return;
+                }
+
+                if (lowerH === 'ctr (destination)') {
+                    summary[h] = '-';
+                } else if (lowerH === 'cost per conversion') {
+                    summary[h] = totals.conv > 0 ? (totals.cost / totals.conv).toFixed(2) : '0.00';
+                } else if (lowerH === 'cpc (destination)') {
+                    summary[h] = totals.clicks > 0 ? (totals.cost / totals.clicks).toFixed(2) : '0.00';
+                } else if (lowerH === 'cost per registration (website)') {
+                    summary[h] = totals.regs > 0 ? (totals.cost / totals.regs).toFixed(2) : '0.00';
+                } else if (lowerH === 'cpa pp') {
+                    summary[h] = totals.convPP > 0 ? (totals.cost / totals.convPP).toFixed(2) : '0.00';
+                } else if (lowerH === 'cost') {
+                    summary[h] = totals.cost.toFixed(2);
+                } else if (lowerH === 'conversions') {
+                    summary[h] = totals.conv;
+                } else if (lowerH === 'clicks (destination)') {
+                    summary[h] = totals.clicks;
+                } else if (lowerH === 'registrations (website)') {
+                    summary[h] = totals.regs;
+                } else if (lowerH === 'conversion pp') {
+                    summary[h] = totals.convPP;
+                } else {
+                    summary[h] = '';
+                }
+            });
+            return summary;
+        };
+
+        // --- UI Rendering ---
+        const renderTable = () => {
+            const processedData = getProcessedData();
+            const summaryRow = getSummaryRow(processedData);
+            
+            document.getElementById('recordCount').textContent = `Showing ${processedData.length} records`;
+
+            // Render Head
+            let headHTML = '<tr>';
+            state.headers.forEach(h => {
+                const isStatus = h === 'Status';
+                const sortIconClass = state.sortCol === h ? 'opacity-100 text-blue-500' : 'opacity-0 group-hover:opacity-50';
+                headHTML += `
+                    <th data-sort="${h}" class="px-4 py-3 font-semibold cursor-pointer hover:bg-gray-200 dark:hover:bg-gray-800 transition-colors border-b border-gray-200 dark:border-gray-700 group select-none ${isStatus ? 'text-center w-16' : ''}">
+                        <div class="flex items-center gap-1 ${isStatus ? 'justify-center' : ''}">
+                            ${h}
+                            <i data-lucide="arrow-up-down" class="w-3 h-3 transition-opacity ${sortIconClass}"></i>
                         </div>
-                      </th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
-                  {processedData.length > 0 ? processedData.map((row, rowIndex) => (
-                    <tr key={rowIndex} className={`hover:bg-gray-50 dark:hover:bg-gray-750/50 transition-colors ${adGroupStatuses[row._adGroupId] !== false ? 'bg-green-50/20 dark:bg-green-900/10' : ''}`}>
-                      {headers.map((col, colIndex) => {
-                        const cellValue = row[col];
-                        const isIdColumn = col && col.toLowerCase().includes('id');
+                    </th>
+                `;
+            });
+            headHTML += '</tr>';
+            document.getElementById('tableHead').innerHTML = headHTML;
+
+            // Render Body
+            let bodyHTML = '';
+            if (processedData.length > 0) {
+                processedData.forEach(row => {
+                    const isChecked = state.adGroupStatuses[row._adGroupId] !== false;
+                    const rowClass = isChecked ? 'bg-green-50/20 dark:bg-green-900/10' : '';
+                    
+                    bodyHTML += `<tr class="hover:bg-gray-50 dark:hover:bg-gray-750/50 transition-colors ${rowClass}">`;
+                    
+                    state.headers.forEach(col => {
+                        const cellValue = row[col] !== undefined ? row[col] : '';
+                        const isIdCol = col && col.toLowerCase().includes('id');
                         const isSpecialCol = col === 'Conversion PP' || col === 'CPA PP';
                         const isStatusCol = col === 'Status';
+                        
+                        const cellClass = `px-4 py-3 ${isSpecialCol ? 'col-special font-medium text-blue-800 dark:text-blue-300' : ''} ${isStatusCol ? 'text-center' : ''}`;
+                        
+                        bodyHTML += `<td class="${cellClass}">`;
+                        
+                        if (isStatusCol) {
+                            bodyHTML += `<input type="checkbox" data-adgroup="${row._adGroupId}" class="status-checkbox w-4 h-4 text-blue-600 bg-gray-100 border-gray-300 rounded focus:ring-blue-500 dark:focus:ring-blue-600 cursor-pointer" ${isChecked ? 'checked' : ''} />`;
+                        } else if (isIdCol && cellValue) {
+                            bodyHTML += `
+                                <div data-copy="${cellValue}" class="inline-flex items-center gap-1.5 cursor-pointer text-blue-600 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-300 hover:underline group" title="Click to copy">
+                                    <span>${cellValue}</span>
+                                    <i data-lucide="copy" class="w-3 h-3 opacity-0 group-hover:opacity-100 transition-opacity"></i>
+                                </div>
+                            `;
+                        } else {
+                            bodyHTML += `<span>${cellValue}</span>`;
+                        }
+                        bodyHTML += `</td>`;
+                    });
+                    bodyHTML += `</tr>`;
+                });
+            } else {
+                bodyHTML = `<tr><td colspan="${state.headers.length}" class="px-4 py-8 text-center text-gray-500">No data found matching your criteria.</td></tr>`;
+            }
+            document.getElementById('tableBody').innerHTML = bodyHTML;
 
-                        return (
-                          <td 
-                            key={colIndex} 
-                            className={`px-4 py-3 ${isSpecialCol ? 'bg-blue-50/30 dark:bg-blue-900/10 font-medium text-blue-800 dark:text-blue-300' : ''} ${isStatusCol ? 'text-center' : ''}`}
-                          >
-                            {isStatusCol ? (
-                              <input 
-                                type="checkbox"
-                                checked={adGroupStatuses[row._adGroupId] !== false}
-                                onChange={() => toggleAdGroupStatus(row._adGroupId)}
-                                className="w-4 h-4 text-blue-600 bg-gray-100 border-gray-300 rounded focus:ring-blue-500 dark:focus:ring-blue-600 dark:ring-offset-gray-800 focus:ring-2 dark:bg-gray-700 dark:border-gray-600 cursor-pointer"
-                              />
-                            ) : isIdColumn ? (
-                              <div 
-                                onClick={() => handleCopy(cellValue)}
-                                className="inline-flex items-center gap-1.5 cursor-pointer text-blue-600 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-300 hover:underline group"
-                                title="Click to copy"
-                              >
-                                <span>{cellValue}</span>
-                                <Copy className="w-3 h-3 opacity-0 group-hover:opacity-100 transition-opacity" />
-                              </div>
-                            ) : (
-                              <span>{cellValue}</span>
-                            )}
-                          </td>
-                        );
-                      })}
-                    </tr>
-                  )) : (
-                    <tr>
-                      <td colSpan={headers.length} className="px-4 py-8 text-center text-gray-500">
-                        No data found matching your criteria.
-                      </td>
-                    </tr>
-                  )}
-                </tbody>
-                  
-                {/* Summary Row (Pinned to bottom) */}
-                {summaryRow && processedData.length > 0 && (
-                  <tfoot className="sticky bottom-0 z-20 shadow-[0_-1px_3px_rgba(0,0,0,0.1)] dark:shadow-[0_-1px_3px_rgba(0,0,0,0.3)]">
-                    <tr>
-                      {headers.map((col, colIndex) => {
-                        const isSpecialCol = col === 'Conversion PP' || col === 'CPA PP';
-                        return (
-                          <td 
-                            key={`summary-${colIndex}`} 
-                            className={`px-4 py-3 font-bold bg-gray-200 dark:bg-gray-700 border-t-2 border-gray-300 dark:border-gray-500 ${isSpecialCol ? 'text-blue-900 dark:text-blue-200' : 'text-gray-900 dark:text-gray-100'}`}
-                          >
-                            {summaryRow[col]}
-                          </td>
-                        )
-                      })}
-                    </tr>
-                  </tfoot>
-                )}
-              </table>
-            </div>
-            
-          </div>
-        )}
-      </div>
+            // Render Foot
+            let footHTML = '';
+            if (summaryRow && processedData.length > 0) {
+                footHTML += '<tr>';
+                state.headers.forEach(col => {
+                    const isSpecialCol = col === 'Conversion PP' || col === 'CPA PP';
+                    footHTML += `<td class="px-4 py-3 font-bold border-t-2 border-gray-300 dark:border-gray-500 ${isSpecialCol ? 'text-blue-900 dark:text-blue-200' : 'text-gray-900 dark:text-gray-100'}">${summaryRow[col]}</td>`;
+                });
+                footHTML += '</tr>';
+            }
+            document.getElementById('tableFoot').innerHTML = footHTML;
 
-      {/* Floating Toast Notification */}
-      {toastMessage && (
-        <div className="fixed bottom-6 right-6 bg-gray-900 dark:bg-white text-white dark:text-gray-900 px-4 py-3 rounded-lg shadow-lg flex items-center gap-2 animate-bounce-short z-50">
-          <CheckCircle2 className="w-5 h-5 text-green-400 dark:text-green-600" />
-          <span className="text-sm font-medium">{toastMessage}</span>
-        </div>
-      )}
-    </div>
-  );
-}
+            // Re-initialize icons for newly added elements
+            lucide.createIcons();
+        };
+
+        // --- Event Listeners ---
+        document.addEventListener('DOMContentLoaded', () => {
+            lucide.createIcons();
+            document.getElementById('startDate').value = getTodayLADate();
+            document.getElementById('endDate').value = getTodayLADate();
+        });
+
+        // Search Input
+        document.getElementById('searchInput').addEventListener('input', (e) => {
+            state.searchQuery = e.target.value;
+            renderTable();
+        });
+
+        // Process Button
+        document.getElementById('processBtn').addEventListener('click', handleProcessData);
+
+        // Table Event Delegation (Sorting, Copy, Checkbox)
+        document.getElementById('tableSection').addEventListener('click', (e) => {
+            // Sort
+            const th = e.target.closest('th[data-sort]');
+            if (th) {
+                const col = th.getAttribute('data-sort');
+                if (state.sortCol === col) {
+                    state.sortDesc = !state.sortDesc;
+                } else {
+                    state.sortCol = col;
+                    state.sortDesc = false;
+                }
+                renderTable();
+                return;
+            }
+
+            // Copy
+            const copyDiv = e.target.closest('[data-copy]');
+            if (copyDiv) {
+                const text = copyDiv.getAttribute('data-copy');
+                const el = document.createElement('textarea');
+                el.value = text;
+                document.body.appendChild(el);
+                el.select();
+                document.execCommand('copy');
+                document.body.removeChild(el);
+                showToast(`Copied: ${text}`);
+            }
+        });
+
+        document.getElementById('tableSection').addEventListener('change', (e) => {
+            if (e.target.classList.contains('status-checkbox')) {
+                const adGroupId = e.target.getAttribute('data-adgroup');
+                toggleAdGroupStatus(adGroupId);
+            }
+        });
+
+        // File Inputs & Drag/Drop
+        const handleFileUpload = (type, file) => {
+            if (!file) return;
+            if (type === 'csv') {
+                state.csvFile = file;
+                document.getElementById('csvFileName').textContent = file.name;
+                document.getElementById('csvIcon').classList.replace('text-green-600', 'text-blue-500');
+                document.getElementById('csvDropZone').classList.add('border-blue-500', 'bg-blue-50', 'dark:bg-blue-900/20');
+            } else {
+                state.htmlFile = file;
+                document.getElementById('htmlFileName').textContent = file.name;
+                document.getElementById('htmlDropZone').classList.add('border-blue-500', 'bg-blue-50', 'dark:bg-blue-900/20');
+            }
+        };
+
+        ['csv', 'html'].forEach(type => {
+            const input = document.getElementById(`${type}Input`);
+            const dropZone = document.getElementById(`${type}DropZone`);
+
+            input.addEventListener('change', (e) => handleFileUpload(type, e.target.files[0]));
+
+            dropZone.addEventListener('dragover', (e) => {
+                e.preventDefault();
+                dropZone.classList.add('border-blue-500', 'bg-blue-50', 'dark:bg-blue-900/20');
+            });
+
+            dropZone.addEventListener('dragleave', (e) => {
+                e.preventDefault();
+                if ((type === 'csv' && !state.csvFile) || (type === 'html' && !state.htmlFile)) {
+                    dropZone.classList.remove('border-blue-500', 'bg-blue-50', 'dark:bg-blue-900/20');
+                }
+            });
+
+            dropZone.addEventListener('drop', (e) => {
+                e.preventDefault();
+                if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+                    handleFileUpload(type, e.dataTransfer.files[0]);
+                }
+            });
+        });
+
+    </script>
+</body>
+</html>
