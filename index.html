@@ -26,6 +26,12 @@
         /* Highlight specific formula columns */
         .col-special { background-color: rgba(239, 246, 255, 0.5); }
         .dark .col-special { background-color: rgba(30, 58, 138, 0.2); }
+        
+        /* Drag UI hints */
+        .drag-over {
+            border-left: 3px solid #3b82f6 !important;
+            background-color: rgba(59, 130, 246, 0.1) !important;
+        }
     </style>
 </head>
 <body class="min-h-screen bg-gray-50 dark:bg-gray-900 text-gray-900 dark:text-gray-100 p-4 md:p-8 font-sans transition-colors duration-200">
@@ -153,6 +159,8 @@
             htmlFile: null,
             data: [],
             headers: [],
+            columnOrder: JSON.parse(localStorage.getItem('tiktok_telegram_col_order')) || [],
+            pinnedColumns: JSON.parse(localStorage.getItem('tiktok_telegram_pinned_cols')) || ['Status'],
             searchQuery: '',
             sortCol: null,
             sortDesc: false,
@@ -233,6 +241,56 @@
                 console.warn('Could not save to localStorage', e);
             }
             renderTable();
+        };
+
+        const togglePin = (colName) => {
+            if (!colName) return;
+            if (state.pinnedColumns.includes(colName)) {
+                state.pinnedColumns = state.pinnedColumns.filter(c => c !== colName);
+            } else {
+                state.pinnedColumns.push(colName);
+            }
+
+            // Always enforce pinned columns to be at the front of the list
+            state.columnOrder = [
+                ...state.columnOrder.filter(c => state.pinnedColumns.includes(c)),
+                ...state.columnOrder.filter(c => !state.pinnedColumns.includes(c))
+            ];
+
+            try {
+                localStorage.setItem('tiktok_telegram_pinned_cols', JSON.stringify(state.pinnedColumns));
+                localStorage.setItem('tiktok_telegram_col_order', JSON.stringify(state.columnOrder));
+            } catch (e) {
+                console.warn('Could not save to localStorage', e);
+            }
+            renderTable();
+        };
+
+        const updateStickyStyles = () => {
+            const styleTag = document.getElementById('sticky-styles') || document.createElement('style');
+            styleTag.id = 'sticky-styles';
+            
+            const ths = document.querySelectorAll('#tableHead th');
+            if (ths.length === 0) return;
+
+            let css = '';
+            let currentLeft = 0;
+
+            state.columnOrder.forEach((col, idx) => {
+                if (state.pinnedColumns.includes(col)) {
+                    css += `
+                        #tableWrapper tr > *:nth-child(${idx + 1}) {
+                            left: ${currentLeft}px !important;
+                        }
+                    `;
+                    currentLeft += ths[idx].offsetWidth;
+                }
+            });
+
+            if (!document.getElementById('sticky-styles')) {
+                document.head.appendChild(styleTag);
+            }
+            styleTag.innerHTML = css;
         };
 
         const showToast = (message) => {
@@ -381,6 +439,26 @@
                 });
 
                 state.headers = finalHeaders;
+                
+                // Integrate and clean up previously saved Column Order vs New Data
+                if (!state.columnOrder || state.columnOrder.length === 0) {
+                    state.columnOrder = [...finalHeaders];
+                } else {
+                    const existingInNew = state.columnOrder.filter(c => finalHeaders.includes(c));
+                    const newCols = finalHeaders.filter(c => !state.columnOrder.includes(c));
+                    state.columnOrder = [...existingInNew, ...newCols];
+                }
+                
+                // Re-apply pinned constraint sorting
+                state.columnOrder = [
+                    ...state.columnOrder.filter(c => state.pinnedColumns.includes(c)),
+                    ...state.columnOrder.filter(c => !state.pinnedColumns.includes(c))
+                ];
+                
+                try {
+                    localStorage.setItem('tiktok_telegram_col_order', JSON.stringify(state.columnOrder));
+                } catch(e) {}
+
                 state.data = finalData;
                 
                 document.getElementById('tableSection').classList.remove('hidden');
@@ -488,6 +566,7 @@
             const summary = {};
             let hasPlacedSummaryText = false;
 
+            // Iterate over ALL headers to process summary
             state.headers.forEach((h) => {
                 const lowerH = h.toLowerCase().trim();
                 
@@ -538,14 +617,24 @@
 
             // Render Head
             let headHTML = '<tr>';
-            state.headers.forEach(h => {
+            state.columnOrder.forEach(h => {
                 const isStatus = h === 'Status';
+                const isPinned = state.pinnedColumns.includes(h);
                 const sortIconClass = state.sortCol === h ? 'opacity-100 text-blue-500' : 'opacity-0 group-hover:opacity-50';
+                
+                const pinnedClasses = isPinned ? 'sticky z-30 bg-gray-100 dark:bg-gray-900 border-r-2 border-gray-300 dark:border-gray-600 shadow-[2px_0_5px_-2px_rgba(0,0,0,0.1)]' : '';
+                
                 headHTML += `
-                    <th data-sort="${h}" class="px-4 py-3 font-semibold cursor-pointer hover:bg-gray-200 dark:hover:bg-gray-800 transition-colors border-b border-gray-200 dark:border-gray-700 group select-none ${isStatus ? 'text-center w-16' : ''}">
-                        <div class="flex items-center gap-1 ${isStatus ? 'justify-center' : ''}">
-                            ${h}
-                            <i data-lucide="arrow-up-down" class="w-3 h-3 transition-opacity ${sortIconClass}"></i>
+                    <th draggable="true" data-sort="${h}" class="px-4 py-3 font-semibold hover:bg-gray-200 dark:hover:bg-gray-800 transition-colors border-b border-gray-200 dark:border-gray-700 group select-none ${pinnedClasses} ${isStatus ? 'w-16' : ''}">
+                        <div class="flex items-center justify-between gap-2 w-full">
+                            <div class="flex items-center gap-1 flex-1 cursor-pointer ${isStatus ? 'justify-center' : ''}">
+                                <i data-lucide="grip-vertical" class="w-4 h-4 text-gray-400 cursor-grab hover:text-gray-600 flex-shrink-0" title="Drag to reorder"></i>
+                                <span class="truncate">${h}</span>
+                                <i data-lucide="arrow-up-down" class="w-3 h-3 transition-opacity ${sortIconClass} flex-shrink-0"></i>
+                            </div>
+                            <button data-pin="${h}" class="p-1 hover:bg-gray-300 dark:hover:bg-gray-700 rounded transition-colors flex-shrink-0" title="${isPinned ? 'Unpin column' : 'Pin column'}">
+                                <i data-lucide="${isPinned ? 'pin-off' : 'pin'}" class="w-4 h-4 ${isPinned ? 'text-blue-500' : 'text-gray-400'}"></i>
+                            </button>
                         </div>
                     </th>
                 `;
@@ -558,17 +647,27 @@
             if (processedData.length > 0) {
                 processedData.forEach(row => {
                     const isChecked = state.adGroupStatuses[row._adGroupId] !== false;
-                    const rowClass = isChecked ? 'bg-green-100 dark:bg-green-800/40' : '';
+                    const rowClass = isChecked ? 'bg-green-100 dark:bg-green-800/40' : 'bg-white dark:bg-gray-800';
                     
-                    bodyHTML += `<tr class="hover:bg-gray-50 dark:hover:bg-gray-750/50 transition-colors ${rowClass}">`;
+                    bodyHTML += `<tr class="group hover:bg-gray-50 dark:hover:bg-gray-750/50 transition-colors ${rowClass}">`;
                     
-                    state.headers.forEach(col => {
+                    state.columnOrder.forEach(col => {
                         const cellValue = row[col] !== undefined ? row[col] : '';
                         const isIdCol = col && col.toLowerCase().includes('id');
                         const isSpecialCol = col === 'Conversion PP' || col === 'CPA PP';
                         const isStatusCol = col === 'Status';
+                        const isPinned = state.pinnedColumns.includes(col);
                         
-                        const cellClass = `px-4 py-3 ${isSpecialCol ? 'col-special font-medium text-blue-800 dark:text-blue-300' : ''} ${isStatusCol ? 'text-center' : ''}`;
+                        let pinnedBg = '';
+                        if (isPinned) {
+                            pinnedBg = isChecked 
+                                ? 'bg-green-100 dark:bg-green-900 group-hover:bg-green-200/80 dark:group-hover:bg-green-800' 
+                                : 'bg-white dark:bg-gray-800 group-hover:bg-gray-50 dark:group-hover:bg-gray-750/50';
+                            pinnedBg += ' border-r-2 border-gray-200 dark:border-gray-700 shadow-[2px_0_5px_-2px_rgba(0,0,0,0.1)]';
+                        }
+                        
+                        const textClass = isSpecialCol ? 'font-medium text-blue-800 dark:text-blue-300' : '';
+                        const cellClass = `px-4 py-3 ${textClass} ${isStatusCol ? 'text-center' : ''} ${isPinned ? `sticky z-10 ${pinnedBg}` : (isSpecialCol ? 'col-special' : '')}`;
                         
                         bodyHTML += `<td class="${cellClass}">`;
                         
@@ -576,7 +675,7 @@
                             bodyHTML += `<input type="checkbox" data-adgroup="${row._adGroupId}" class="status-checkbox w-4 h-4 text-blue-600 bg-gray-100 border-gray-300 rounded focus:ring-blue-500 dark:focus:ring-blue-600 cursor-pointer" ${isChecked ? 'checked' : ''} />`;
                         } else if (isIdCol && cellValue) {
                             bodyHTML += `
-                                <div data-copy="${cellValue}" class="inline-flex items-center gap-1.5 cursor-pointer text-blue-600 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-300 hover:underline group" title="Click to copy">
+                                <div data-copy="${cellValue}" class="inline-flex items-center gap-1.5 cursor-pointer text-blue-600 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-300 hover:underline copy-group" title="Click to copy">
                                     <span>${cellValue}</span>
                                     <i data-lucide="copy" class="w-3 h-3 opacity-0 group-hover:opacity-100 transition-opacity"></i>
                                 </div>
@@ -589,7 +688,7 @@
                     bodyHTML += `</tr>`;
                 });
             } else {
-                bodyHTML = `<tr><td colspan="${state.headers.length}" class="px-4 py-8 text-center text-gray-500">No data found matching your criteria.</td></tr>`;
+                bodyHTML = `<tr><td colspan="${state.columnOrder.length}" class="px-4 py-8 text-center text-gray-500">No data found matching your criteria.</td></tr>`;
             }
             document.getElementById('tableBody').innerHTML = bodyHTML;
 
@@ -597,16 +696,21 @@
             let footHTML = '';
             if (summaryRow && processedData.length > 0) {
                 footHTML += '<tr>';
-                state.headers.forEach(col => {
+                state.columnOrder.forEach(col => {
                     const isSpecialCol = col === 'Conversion PP' || col === 'CPA PP';
-                    footHTML += `<td class="px-4 py-3 font-bold border-t-2 border-gray-300 dark:border-gray-500 ${isSpecialCol ? 'text-blue-900 dark:text-blue-200' : 'text-gray-900 dark:text-gray-100'}">${summaryRow[col]}</td>`;
+                    const isPinned = state.pinnedColumns.includes(col);
+                    const pinnedClasses = isPinned ? 'sticky z-30 bg-gray-200 dark:bg-gray-700 border-r-2 border-gray-300 dark:border-gray-500 shadow-[2px_0_5px_-2px_rgba(0,0,0,0.1)]' : '';
+                    
+                    footHTML += `<td class="px-4 py-3 font-bold border-t-2 border-gray-300 dark:border-gray-500 ${isSpecialCol ? 'text-blue-900 dark:text-blue-200' : 'text-gray-900 dark:text-gray-100'} ${pinnedClasses}">${summaryRow[col]}</td>`;
                 });
                 footHTML += '</tr>';
             }
             document.getElementById('tableFoot').innerHTML = footHTML;
 
-            // Re-initialize icons for newly added elements
             lucide.createIcons();
+            
+            // Wait for DOM layout to complete before applying sticky positioning
+            requestAnimationFrame(updateStickyStyles);
         };
 
         // --- Event Listeners ---
@@ -614,6 +718,7 @@
             lucide.createIcons();
             document.getElementById('startDate').value = getTodayLADate();
             document.getElementById('endDate').value = getTodayLADate();
+            window.addEventListener('resize', updateStickyStyles);
         });
 
         // Search Input
@@ -625,11 +730,22 @@
         // Process Button
         document.getElementById('processBtn').addEventListener('click', handleProcessData);
 
-        // Table Event Delegation (Sorting, Copy, Checkbox)
+        // Table Event Delegation (Sorting, Copy, Checkbox, Pinning)
         document.getElementById('tableSection').addEventListener('click', (e) => {
+            // Pin Toggle
+            const pinBtn = e.target.closest('[data-pin]');
+            if (pinBtn) {
+                e.stopPropagation();
+                togglePin(pinBtn.getAttribute('data-pin'));
+                return;
+            }
+
             // Sort
             const th = e.target.closest('th[data-sort]');
             if (th) {
+                // Ensure we don't sort when dragging via the grip icon
+                if(e.target.closest('[data-lucide="grip-vertical"]')) return;
+                
                 const col = th.getAttribute('data-sort');
                 if (state.sortCol === col) {
                     state.sortDesc = !state.sortDesc;
@@ -660,6 +776,71 @@
                 const adGroupId = e.target.getAttribute('data-adgroup');
                 toggleAdGroupStatus(adGroupId);
             }
+        });
+
+        // Column Drag and Drop Events
+        const tableHead = document.getElementById('tableHead');
+        let dragSrcCol = null;
+
+        tableHead.addEventListener('dragstart', (e) => {
+            const th = e.target.closest('th');
+            if (!th) return;
+            dragSrcCol = th.getAttribute('data-sort');
+            e.dataTransfer.effectAllowed = 'move';
+            e.dataTransfer.setData('text/plain', dragSrcCol);
+            th.classList.add('opacity-50');
+        });
+
+        tableHead.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            e.dataTransfer.dropEffect = 'move';
+            return false;
+        });
+
+        tableHead.addEventListener('dragenter', (e) => {
+            const th = e.target.closest('th');
+            if (th && th.getAttribute('data-sort') !== dragSrcCol) {
+                th.classList.add('drag-over');
+            }
+        });
+
+        tableHead.addEventListener('dragleave', (e) => {
+            const th = e.target.closest('th');
+            if (th) th.classList.remove('drag-over');
+        });
+
+        tableHead.addEventListener('drop', (e) => {
+            e.stopPropagation();
+            const th = e.target.closest('th');
+            if (dragSrcCol && th) {
+                const destCol = th.getAttribute('data-sort');
+                if (dragSrcCol !== destCol) {
+                    const fromIdx = state.columnOrder.indexOf(dragSrcCol);
+                    const toIdx = state.columnOrder.indexOf(destCol);
+                    
+                    state.columnOrder.splice(fromIdx, 1);
+                    state.columnOrder.splice(toIdx, 0, dragSrcCol);
+                    
+                    // Enforce pinned structure
+                    state.columnOrder = [
+                        ...state.columnOrder.filter(c => state.pinnedColumns.includes(c)),
+                        ...state.columnOrder.filter(c => !state.pinnedColumns.includes(c))
+                    ];
+                    
+                    try {
+                        localStorage.setItem('tiktok_telegram_col_order', JSON.stringify(state.columnOrder));
+                    } catch(err) {}
+                    
+                    renderTable();
+                }
+            }
+            return false;
+        });
+
+        tableHead.addEventListener('dragend', (e) => {
+            const th = e.target.closest('th');
+            if (th) th.classList.remove('opacity-50');
+            document.querySelectorAll('#tableHead th').forEach(el => el.classList.remove('drag-over'));
         });
 
         // File Inputs & Drag/Drop
